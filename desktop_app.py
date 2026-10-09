@@ -3,6 +3,7 @@ import base64
 import importlib.util
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from process_loopback import capture_process_audio, get_audio_processes
 from server import VOICES, generate_audio
 
 WINDOW_TITLE = "Discord TTS Microphone"
@@ -65,6 +67,9 @@ PIPER_MIXED_PROVIDER = "piper-mixed"
 PIPER_MODEL = "th_TH-tsync2-medium"
 PIPER_MODEL_MIN_SIZE = 50_000_000
 MIXED_SEGMENT_SILENCE_SECONDS = 0.12
+LOOPBACK_CHUNK_FRAMES = 1024
+PROCESS_LOOPBACK_MODE = "process"
+DEVICE_LOOPBACK_MODE = "device"
 PIPER_MODEL_DIRECTORY = (
     Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
     / "DiscordTTS"
@@ -114,6 +119,237 @@ def get_windows_voices():
     )
     voices = json.loads(completed.stdout.strip() or "[]")
     return [voices] if isinstance(voices, dict) else voices
+
+
+def get_loopback_devices():
+    import pyaudiowpatch as pyaudio
+
+    audio = pyaudio.PyAudio()
+    try:
+        wasapi_host_indexes = {
+            index
+            for index in range(audio.get_host_api_count())
+            if audio.get_host_api_info_by_index(index)["name"] == "Windows WASAPI"
+        }
+        return [
+            audio.get_device_info_by_index(index)["name"]
+            for index in range(audio.get_device_count())
+            if audio.get_device_info_by_index(index).get("isLoopbackDevice")
+            and audio.get_device_info_by_index(index).get("hostApi")
+            in wasapi_host_indexes
+        ]
+    finally:
+        audio.terminate()
+
+
+def get_wasapi_host_index(audio):
+    for index in range(audio.get_host_api_count()):
+        if audio.get_host_api_info_by_index(index)["name"] == "Windows WASAPI":
+            return index
+    raise RuntimeError("ไม่พบ Windows WASAPI audio backend")
+
+
+class AudioLoopbackRelay(QThread):
+    started_relay = Signal()
+    failed = Signal(str)
+
+    def __init__(self, source_name, target_names):
+        super().__init__()
+        self.source_name = source_name
+        self.target_names = target_names
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        try:
+            self._relay_audio()
+        except Exception as error:
+            if not self._stop_event.is_set():
+                self.failed.emit(str(error))
+
+    def _relay_audio(self):
+        import pyaudiowpatch as pyaudio
+
+        audio = pyaudio.PyAudio()
+        streams = []
+        try:
+            wasapi_host_index = get_wasapi_host_index(audio)
+            source = self._find_device(
+                audio,
+                wasapi_host_index,
+                self.source_name,
+                loopback=True,
+            )
+            if source is None:
+                raise RuntimeError("ไม่พบ Capture Source ที่เลือก กรุณา refresh แอป")
+
+            channels = min(2, int(source["maxInputChannels"]))
+            sample_rate = int(source["defaultSampleRate"])
+            capture = audio.open(
+                format=pyaudio.paInt16,
+                channels=channels,
+                rate=sample_rate,
+                input=True,
+                input_device_index=source["index"],
+                frames_per_buffer=LOOPBACK_CHUNK_FRAMES,
+            )
+            streams.append(capture)
+
+            for target_name in self.target_names:
+                self._open_output_stream(
+                    audio,
+                    streams,
+                    target_name,
+                    wasapi_host_index,
+                    channels,
+                    sample_rate,
+                    pyaudio,
+                )
+
+            self.started_relay.emit()
+            while not self._stop_event.is_set():
+                frames = capture.read(
+                    LOOPBACK_CHUNK_FRAMES,
+                    exception_on_overflow=False,
+                )
+                for output_stream in streams[1:]:
+                    output_stream.write(frames)
+        finally:
+            self._close_streams(streams)
+            audio.terminate()
+
+    def _open_output_stream(
+        self, audio, streams, target_name, host_index, channels, sample_rate, pyaudio
+    ):
+        target = self._find_device(audio, host_index, target_name, loopback=False)
+        if target is None:
+            raise RuntimeError(f"ไม่พบ Output Device: {target_name}")
+        if target["maxOutputChannels"] < channels:
+            raise RuntimeError(f"Output {target_name} ไม่รองรับ {channels} channels")
+        output_stream = audio.open(
+            format=pyaudio.paInt16,
+            channels=channels,
+            rate=sample_rate,
+            output=True,
+            output_device_index=target["index"],
+            frames_per_buffer=LOOPBACK_CHUNK_FRAMES,
+        )
+        streams.append(output_stream)
+
+    @staticmethod
+    def _find_device(audio, host_index, name, loopback):
+        for index in range(audio.get_device_count()):
+            device = audio.get_device_info_by_index(index)
+            if (
+                device.get("hostApi") == host_index
+                and device.get("isLoopbackDevice", False) == loopback
+                and device["name"] == name
+            ):
+                return device
+        return None
+
+    @staticmethod
+    def _close_streams(streams):
+        for stream in reversed(streams):
+            try:
+                stream.stop_stream()
+            except OSError:
+                pass
+            stream.close()
+
+
+class ProcessLoopbackRelay(QThread):
+    started_relay = Signal()
+    failed = Signal(str)
+
+    def __init__(self, process_id, target_names):
+        super().__init__()
+        self.process_id = process_id
+        self.target_names = target_names
+        self._stop_event = threading.Event()
+        self._capture_error = None
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        import pyaudiowpatch as pyaudio
+
+        audio = pyaudio.PyAudio()
+        streams = []
+        frames_queue = queue.Queue(maxsize=8)
+        capture_errors = []
+        capture_thread = None
+
+        def capture_process_frames():
+            try:
+                capture_process_audio(
+                    self.process_id,
+                    self._enqueue_frames,
+                    self._stop_event,
+                )
+            except Exception as error:
+                capture_errors.append(error)
+                self._stop_event.set()
+
+        self._frames_queue = frames_queue
+        try:
+            host_index = get_wasapi_host_index(audio)
+            for target_name in self.target_names:
+                target = AudioLoopbackRelay._find_device(
+                    audio,
+                    host_index,
+                    target_name,
+                    loopback=False,
+                )
+                if target is None:
+                    raise RuntimeError(f"ไม่พบ Output Device: {target_name}")
+                output_stream = audio.open(
+                    format=pyaudio.paInt16,
+                    channels=2,
+                    rate=48000,
+                    output=True,
+                    output_device_index=target["index"],
+                    frames_per_buffer=LOOPBACK_CHUNK_FRAMES,
+                )
+                streams.append(output_stream)
+
+            capture_thread = threading.Thread(
+                target=capture_process_frames,
+                name=f"ProcessLoopback-{self.process_id}",
+                daemon=True,
+            )
+            capture_thread.start()
+            self.started_relay.emit()
+            while capture_thread.is_alive() or not frames_queue.empty():
+                try:
+                    frames = frames_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                for output_stream in streams:
+                    output_stream.write(frames)
+            if capture_errors:
+                raise capture_errors[0]
+        except Exception as error:
+            if not self._stop_event.is_set():
+                self._capture_error = error
+                self.failed.emit(str(error))
+        finally:
+            self._stop_event.set()
+            if capture_thread is not None:
+                capture_thread.join(timeout=2)
+            AudioLoopbackRelay._close_streams(streams)
+            audio.terminate()
+
+    def _enqueue_frames(self, frames):
+        while not self._stop_event.is_set():
+            try:
+                self._frames_queue.put(frames, timeout=0.05)
+                return
+            except queue.Full:
+                continue
 
 
 def piper_thai_dependencies_available():
@@ -424,7 +660,7 @@ class TTSWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
-        self.resize(560, 620)
+        self.resize(560, 720)
 
         self.media_devices = QMediaDevices(self)
         self.windows_voice_error = None
@@ -453,6 +689,10 @@ class TTSWindow(QMainWindow):
         self.output_devices = []
         self.output_combos = []
         self.selected_output_devices = [None, None]
+        self.loopback_devices = []
+        self.loopback_processes = []
+        self.loopback_worker = None
+        self.loopback_stop_requested = False
         self.active_player_indexes = set()
         self.ended_player_indexes = set()
 
@@ -522,6 +762,28 @@ class TTSWindow(QMainWindow):
 
         layout.addWidget(QLabel("Message"))
         self.message_input = MessageInput()
+        layout.addWidget(QLabel("Capture Mode"))
+        self.loopback_mode_combo = QComboBox()
+        self.loopback_mode_combo.addItem("โปรแกรม (process tree)", PROCESS_LOOPBACK_MODE)
+        self.loopback_mode_combo.addItem("Playback device ทั้งหมด", DEVICE_LOOPBACK_MODE)
+        self.loopback_mode_combo.currentIndexChanged.connect(
+            self._refresh_loopback_sources
+        )
+        layout.addWidget(self.loopback_mode_combo)
+
+        layout.addWidget(QLabel("Capture Source"))
+        self.loopback_combo = QComboBox()
+        self._refresh_loopback_sources()
+        capture_source_row = QHBoxLayout()
+        capture_source_row.addWidget(self.loopback_combo, 1)
+        self.loopback_refresh_button = QPushButton("รีเฟรช")
+        self.loopback_refresh_button.clicked.connect(self._refresh_loopback_sources)
+        capture_source_row.addWidget(self.loopback_refresh_button)
+        layout.addLayout(capture_source_row)
+        self.loopback_button = QPushButton("เริ่มส่งเสียงจากโปรแกรม")
+        self.loopback_button.setCheckable(True)
+        self.loopback_button.toggled.connect(self._toggle_loopback)
+        layout.addWidget(self.loopback_button)
         self.message_input.setPlaceholderText("พิมพ์ข้อความแล้วกด Enter เพื่อพูด")
         self.message_input.setMinimumHeight(150)
         self.message_input.speak_requested.connect(self.speak)
@@ -567,6 +829,127 @@ class TTSWindow(QMainWindow):
             return
         for voice in sorted(VOICES):
             self.voice_combo.addItem(VOICE_LABELS[voice], voice)
+
+    def _refresh_loopback_sources(self):
+        selected_source = self.loopback_combo.currentData()
+        self.loopback_combo.blockSignals(True)
+        self.loopback_combo.clear()
+        mode = self.loopback_mode_combo.currentData()
+        try:
+            if mode == PROCESS_LOOPBACK_MODE:
+                self.loopback_processes = get_audio_processes()
+                self.loopback_combo.addItem("เลือกโปรแกรมที่กำลังเล่นเสียง...", None)
+                for process in self.loopback_processes:
+                    state = "กำลังเล่นเสียง" if process["active"] else "พร้อม"
+                    label = (
+                        f"{process['process_name']} (PID {process['pid']}) · {state}"
+                    )
+                    self.loopback_combo.addItem(label, process)
+                selected_pid = selected_source.get("pid") if selected_source else None
+                for index, process in enumerate(self.loopback_processes, start=1):
+                    if process["pid"] == selected_pid:
+                        self.loopback_combo.setCurrentIndex(index)
+                        break
+            else:
+                self.loopback_devices = get_loopback_devices()
+                self.loopback_combo.addItem("เลือก playback device ต้นทาง...", None)
+                for device_name in self.loopback_devices:
+                    self.loopback_combo.addItem(device_name, device_name)
+                if selected_source in self.loopback_devices:
+                    self.loopback_combo.setCurrentIndex(
+                        self.loopback_combo.findData(selected_source)
+                    )
+        except (ImportError, OSError, RuntimeError) as error:
+            self.loopback_combo.addItem(f"โหลด Capture Source ไม่ได้: {error}", None)
+        self.loopback_combo.blockSignals(False)
+
+    def _toggle_loopback(self, enabled):
+        if not enabled:
+            self._stop_loopback()
+            return
+
+        mode = self.loopback_mode_combo.currentData()
+        source = self.loopback_combo.currentData()
+        target_devices = [
+            device for device in self.selected_output_devices if device is not None
+        ]
+        if source is None:
+            self._set_status("เลือก Capture Source ก่อนเริ่มส่งเสียง")
+            self._reset_loopback_button()
+            return
+        if not target_devices:
+            self._set_status("เลือก Output Device ก่อนเริ่มส่งเสียง")
+            self._reset_loopback_button()
+            return
+
+        if mode == DEVICE_LOOPBACK_MODE:
+            source_output_name = source.removesuffix(" [Loopback]").casefold()
+            if any(
+                device.description().casefold() == source_output_name
+                for device in target_devices
+            ):
+                self._set_status(
+                    "Capture Source ต้องต่างจาก Output เพื่อป้องกันเสียงวนกลับ"
+                )
+                self._reset_loopback_button()
+                return
+            source_label = source_output_name
+            worker = AudioLoopbackRelay(
+                source,
+                [device.description() for device in target_devices],
+            )
+        else:
+            source_label = source["process_name"]
+            worker = ProcessLoopbackRelay(
+                source["pid"],
+                [device.description() for device in target_devices],
+            )
+
+        self.loopback_stop_requested = False
+        self.loopback_worker = worker
+        self.loopback_worker.started_relay.connect(
+            lambda: self._set_status(
+                f"กำลังส่งเสียงจาก {source_label} ไป {len(target_devices)} Output"
+            )
+        )
+        self.loopback_worker.failed.connect(self._on_loopback_failed)
+        self.loopback_worker.finished.connect(self._on_loopback_finished)
+        self._set_loopback_controls_enabled(False)
+        self.loopback_button.setText("หยุดส่งเสียงจากโปรแกรม")
+        self.loopback_worker.start()
+
+    def _stop_loopback(self):
+        if self.loopback_worker is not None and self.loopback_worker.isRunning():
+            self.loopback_stop_requested = True
+            self.loopback_worker.stop()
+            self._set_status("กำลังหยุดรับเสียงจากโปรแกรม...")
+            return
+        self._set_loopback_controls_enabled(True)
+
+    def _on_loopback_failed(self, message):
+        self._set_status(f"ส่งเสียงจากโปรแกรมไม่สำเร็จ: {message}")
+        if self.loopback_worker is not None:
+            self.loopback_worker.stop()
+
+    def _on_loopback_finished(self):
+        self.loopback_worker = None
+        self._reset_loopback_button()
+        self._set_loopback_controls_enabled(True)
+        if self.loopback_stop_requested:
+            self._set_status("หยุดส่งเสียงจากโปรแกรมแล้ว")
+
+    def _reset_loopback_button(self):
+        self.loopback_button.blockSignals(True)
+        self.loopback_button.setChecked(False)
+        self.loopback_button.setText("เริ่มส่งเสียงจากโปรแกรม")
+        self.loopback_button.blockSignals(False)
+
+    def _set_loopback_controls_enabled(self, enabled):
+        self.loopback_mode_combo.setEnabled(enabled)
+        self.loopback_combo.setEnabled(enabled)
+        self.loopback_refresh_button.setEnabled(enabled)
+        for combo in self.output_combos:
+            combo.setEnabled(enabled)
 
     def _refresh_outputs(self):
         selected_ids = [combo.currentData() for combo in self.output_combos]
@@ -757,6 +1140,12 @@ class TTSWindow(QMainWindow):
         self.status_label.setText(text)
 
     def closeEvent(self, event):
+        if self.loopback_worker is not None and self.loopback_worker.isRunning():
+            self.loopback_worker.stop()
+            if not self.loopback_worker.wait(1500):
+                self._set_status("กำลังหยุดรับเสียง กรุณาปิดหน้าต่างอีกครั้ง")
+                event.ignore()
+                return
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
             if not self.worker.wait(WORKER_SHUTDOWN_TIMEOUT_MS):

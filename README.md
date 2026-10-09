@@ -44,5 +44,13 @@ virtual audio cable, select the cable's playback device here and select its
 matching recording device as Discord's input. Two outputs play at nearly the
 same time; a small timing difference between devices is possible.
 
+To relay another program's audio, set `Capture Mode` to `โปรแกรม (process tree)`,
+refresh the process list, select its PID, choose the destination under `Output
+Device 1/2`, then start the relay. This uses Windows Process Loopback and
+captures that process and its child processes; it requires Windows 10 build
+20348 or newer. Browser audio is selected at process level, not reliably per
+tab, because multiple tabs may share renderer processes. `Playback device
+ทั้งหมด` remains available as a device-wide fallback.
+
 The desktop app uses Windows audio devices directly. `server.py` and
 `index.html` remain available for the browser version.

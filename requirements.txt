@@ -2,3 +2,5 @@ edge-tts>=7.2.8,<8
 gTTS>=2.5.4,<3
 piper-tts>=1.8,<2
 PySide6>=6.8,<7
+PyAudioWPatch>=0.2.12.9,<0.3
+pycaw>=20260927
