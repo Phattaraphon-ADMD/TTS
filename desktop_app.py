@@ -1,12 +1,16 @@
 import asyncio
 import base64
+import importlib.util
 import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
-from io import BytesIO
 from pathlib import Path
+import wave
+from io import BytesIO
 
 from gtts import gTTS
 from PySide6.QtCore import QThread, QUrl, Qt, Signal
@@ -43,6 +47,18 @@ VOICE_LABELS = {
 EDGE_PROVIDER = "edge"
 WINDOWS_PROVIDER = "windows"
 GTTS_PROVIDER = "gtts"
+PIPER_PROVIDER = "piper"
+PIPER_MIXED_PROVIDER = "piper-mixed"
+PIPER_MODEL = "th_TH-tsync2-medium"
+PIPER_MODEL_MIN_SIZE = 50_000_000
+MIXED_SEGMENT_SILENCE_SECONDS = 0.12
+PIPER_MODEL_DIRECTORY = (
+    Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+    / "DiscordTTS"
+    / "piper"
+)
+_piper_voice = None
+_piper_voice_lock = threading.Lock()
 WINDOWS_VOICE_LIST_SCRIPT = (
     "$ErrorActionPreference = 'Stop'; "
     "Add-Type -AssemblyName System.Speech; "
@@ -87,6 +103,109 @@ def get_windows_voices():
     return [voices] if isinstance(voices, dict) else voices
 
 
+def piper_thai_dependencies_available():
+    return all(
+        importlib.util.find_spec(module_name) is not None
+        for module_name in ("piper", "tltk", "unicode_rbnf")
+    )
+
+
+def load_piper_thai_voice(progress_callback):
+    global _piper_voice
+    with _piper_voice_lock:
+        if _piper_voice is not None:
+            return _piper_voice
+
+        model_path = PIPER_MODEL_DIRECTORY / f"{PIPER_MODEL}.onnx"
+        config_path = Path(f"{model_path}.json")
+        PIPER_MODEL_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        if model_path.exists() and model_path.stat().st_size < PIPER_MODEL_MIN_SIZE:
+            model_path.unlink()
+        if not model_path.exists() or not config_path.exists():
+            progress_callback("กำลังดาวน์โหลดโมเดล Piper Thai ครั้งแรก (ประมาณ 63 MB)...")
+            from piper.download_voices import download_voice
+
+            download_voice(PIPER_MODEL, PIPER_MODEL_DIRECTORY)
+
+        if model_path.stat().st_size < PIPER_MODEL_MIN_SIZE:
+            raise RuntimeError("ดาวน์โหลด Piper Thai model ไม่ครบ กรุณาลองใหม่")
+
+        progress_callback("กำลังโหลด Piper Thai model...")
+        from piper import PiperVoice
+
+        _piper_voice = PiperVoice.load(str(model_path))
+        return _piper_voice
+
+
+def split_thai_english(text):
+    token_pattern = re.compile(r"[\u0e00-\u0e7f]+|[A-Za-z0-9]+|[^\u0e00-\u0e7fA-Za-z0-9]+")
+    segments = []
+    pending_separator = ""
+    for token in token_pattern.findall(text):
+        if "\u0e00" <= token[0] <= "\u0e7f":
+            language = "thai"
+        elif token[0].isascii() and token[0].isalnum():
+            language = "english"
+        else:
+            if segments:
+                segments[-1][1] += token
+            else:
+                pending_separator += token
+            continue
+
+        if segments and segments[-1][0] == language:
+            segments[-1][1] += token
+        else:
+            segments.append([language, pending_separator + token])
+            pending_separator = ""
+
+    if pending_separator and segments:
+        segments[-1][1] += pending_separator
+    return segments
+
+
+def concatenate_wav_segments(audio_segments):
+    if not audio_segments:
+        raise ValueError("ไม่พบข้อความภาษาไทยหรือภาษาอังกฤษสำหรับสร้างเสียง")
+
+    first_segment = wave.open(BytesIO(audio_segments[0]), "rb")
+    first_params = first_segment.getparams()
+    first_segment.close()
+    audio_buffer = BytesIO()
+    with wave.open(audio_buffer, "wb") as combined_wave:
+        combined_wave.setparams(
+            (
+                first_params.nchannels,
+                first_params.sampwidth,
+                first_params.framerate,
+                0,
+                first_params.comptype,
+                first_params.compname,
+            )
+        )
+        for index, segment in enumerate(audio_segments):
+            with wave.open(BytesIO(segment), "rb") as source_wave:
+                params = source_wave.getparams()
+                if (
+                    params.nchannels != first_params.nchannels
+                    or params.sampwidth != first_params.sampwidth
+                    or params.framerate != first_params.framerate
+                ):
+                    raise ValueError("รูปแบบ WAV ของ voice ไทยและอังกฤษไม่ตรงกัน")
+                if index:
+                    silence_frames = int(
+                        first_params.framerate * MIXED_SEGMENT_SILENCE_SECONDS
+                    )
+                    silence_size = (
+                        silence_frames
+                        * first_params.nchannels
+                        * first_params.sampwidth
+                    )
+                    combined_wave.writeframes(b"\x00" * silence_size)
+                combined_wave.writeframes(source_wave.readframes(params.nframes))
+    return audio_buffer.getvalue()
+
+
 class MessageInput(QPlainTextEdit):
     speak_requested = Signal()
 
@@ -103,6 +222,7 @@ class MessageInput(QPlainTextEdit):
 class TTSWorker(QThread):
     audio_ready = Signal(bytes)
     failed = Signal(str)
+    progress = Signal(str)
 
     def __init__(self, text, voice, provider):
         super().__init__()
@@ -132,6 +252,10 @@ class TTSWorker(QThread):
                 audio_data = self._generate_windows_audio()
             elif self.provider == GTTS_PROVIDER:
                 audio_data = self._generate_gtts_audio()
+            elif self.provider == PIPER_PROVIDER:
+                audio_data = self._generate_piper_audio()
+            elif self.provider == PIPER_MIXED_PROVIDER:
+                audio_data = self._generate_mixed_audio()
             else:
                 audio_data = self._generate_edge_audio()
             if self._is_cancelled():
@@ -178,14 +302,39 @@ class TTSWorker(QThread):
         speech.write_to_fp(audio_buffer)
         return audio_buffer.getvalue()
 
-    def _generate_windows_audio(self):
+    def _generate_piper_audio(self):
+        return self._generate_piper_wav(self.text)
+
+    def _generate_piper_wav(self, text):
+        piper_voice = load_piper_thai_voice(self.progress.emit)
+        self.progress.emit("กำลังสร้างเสียง Piper Thai แบบออฟไลน์...")
+        audio_buffer = BytesIO()
+        with wave.open(audio_buffer, "wb") as wave_file:
+            piper_voice.synthesize_wav(text, wave_file)
+        return audio_buffer.getvalue()
+
+    def _generate_mixed_audio(self):
+        segments = split_thai_english(self.text)
+        audio_segments = []
+        for language, segment_text in segments:
+            if language == "thai":
+                audio_segments.append(self._generate_piper_wav(segment_text))
+            else:
+                audio_segments.append(
+                    self._generate_windows_audio(segment_text, self.voice["name"])
+                )
+        return concatenate_wav_segments(audio_segments)
+
+    def _generate_windows_audio(self, text=None, voice=None):
+        text = self.text if text is None else text
+        voice = self.voice if voice is None else voice
         temp_file_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
                 temp_file_path = Path(temp_file.name)
             payload = base64.b64encode(
                 json.dumps(
-                    {"text": self.text, "voice": self.voice, "path": str(temp_file_path)},
+                    {"text": text, "voice": voice, "path": str(temp_file_path)},
                     ensure_ascii=True,
                 ).encode("utf-8")
             ).decode("ascii")
@@ -291,6 +440,12 @@ class TTSWindow(QMainWindow):
         self.voice_source_combo = QComboBox()
         self.voice_source_combo.addItem("Edge TTS (ออนไลน์)", EDGE_PROVIDER)
         self.voice_source_combo.addItem("Google TTS ภาษาไทย (ออนไลน์)", GTTS_PROVIDER)
+        self.voice_source_combo.addItem("Piper ภาษาไทย (ออฟไลน์)", PIPER_PROVIDER)
+        if any(voice["culture"].lower().startswith("en") for voice in self.windows_voices):
+            self.voice_source_combo.addItem(
+                "Piper ไทย + Windows English (ออฟไลน์)",
+                PIPER_MIXED_PROVIDER,
+            )
         if self.windows_voices:
             self.voice_source_combo.addItem("Windows Speech (ออฟไลน์)", WINDOWS_PROVIDER)
         self.voice_source_combo.currentIndexChanged.connect(self._refresh_voice_choices)
@@ -343,6 +498,15 @@ class TTSWindow(QMainWindow):
             return
         if provider == GTTS_PROVIDER:
             self.voice_combo.addItem("Thai (Google Translate TTS)", "th")
+            return
+        if provider == PIPER_PROVIDER:
+            self.voice_combo.addItem("Thai tsync2 (medium, 63 MB)", PIPER_MODEL)
+            return
+        if provider == PIPER_MIXED_PROVIDER:
+            for voice in self.windows_voices:
+                if voice["culture"].lower().startswith("en"):
+                    label = f"Thai Piper + {voice['name']} ({voice['culture']})"
+                    self.voice_combo.addItem(label, voice)
             return
         for voice in sorted(VOICES):
             self.voice_combo.addItem(VOICE_LABELS[voice], voice)
@@ -417,6 +581,18 @@ class TTSWindow(QMainWindow):
             return
         provider = self.voice_source_combo.currentData()
         voice = self.voice_combo.currentData()
+        if provider in (PIPER_PROVIDER, PIPER_MIXED_PROVIDER) and not piper_thai_dependencies_available():
+            self._set_status(
+                "Piper Thai ยังติดตั้งไม่ครบ; ดูคำสั่งเสริมใน README.md"
+            )
+            return
+        if provider == PIPER_PROVIDER and any(
+            character.isascii() and character.isalpha() for character in text
+        ):
+            self._set_status(
+                "Piper Thai ไม่รองรับข้อความอังกฤษ; เลือก Piper ไทย + Windows English"
+            )
+            return
         if provider == WINDOWS_PROVIDER:
             contains_thai = any("\u0e00" <= character <= "\u0e7f" for character in text)
             if contains_thai and not voice["culture"].lower().startswith("th"):
@@ -437,9 +613,16 @@ class TTSWindow(QMainWindow):
             voice,
             provider,
         )
-        audio_suffix = ".wav" if provider == WINDOWS_PROVIDER else ".mp3"
+        audio_suffix = (
+            ".wav"
+            if provider in (WINDOWS_PROVIDER, PIPER_PROVIDER, PIPER_MIXED_PROVIDER)
+            else ".mp3"
+        )
         self.worker.audio_ready.connect(
             lambda audio_data: self._play_audio(request_id, audio_data, audio_suffix)
+        )
+        self.worker.progress.connect(
+            lambda message: self._on_worker_progress(request_id, message)
         )
         self.worker.failed.connect(
             lambda message: self._on_generation_error(request_id, message)
@@ -486,6 +669,10 @@ class TTSWindow(QMainWindow):
     def _on_generation_error(self, request_id, message):
         if request_id == self.request_id:
             self._set_status(f"สร้างเสียงไม่สำเร็จ: {message}")
+
+    def _on_worker_progress(self, request_id, message):
+        if request_id == self.request_id:
+            self._set_status(message)
 
     def _on_worker_finished(self, worker):
         if self.worker is worker:
