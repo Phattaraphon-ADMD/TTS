@@ -1,0 +1,221 @@
+
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Discord TTS Microphone</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    background: #10121c;
+    color: #f4f5fa;
+    max-width: 650px;
+    margin: 50px auto;
+    padding: 20px;
+  }
+  h2 { margin-bottom: 6px; }
+  p { color: #a7aac0; }
+  textarea, select, button {
+    box-sizing: border-box;
+    width: 100%;
+    background: #202433;
+    border: 1px solid #41465a;
+    border-radius: 10px;
+    padding: 12px;
+    color: white;
+    font-size: 16px;
+    margin: 8px 0 16px;
+  }
+  textarea { height: 130px; resize: vertical; }
+  button {
+    background: #5865f2;
+    border: 0;
+    cursor: pointer;
+    font-weight: bold;
+  }
+  button:disabled { opacity: .5; }
+  label { display: block; margin-top: 12px; }
+  .stop { background: #bf3d4b; }
+  #status { color: #9ddbba; }
+</style>
+</head>
+<body>
+<h2>Discord TTS Microphone</h2>
+<p>ส่งเฉพาะเสียง TTS เข้า Virtual Microphone</p>
+
+<label>Output Device</label>
+<button id="choose" type="button">เลือก Output Device</button>
+<div id="deviceName">ยังไม่ได้เลือกอุปกรณ์</div>
+
+<label>Voice</label>
+<select id="voice">
+  <option value="th-TH-NiwatNeural">Thai - Male</option>
+  <option value="th-TH-PremwadeeNeural">Thai - Female</option>
+  <option value="en-US-GuyNeural">English - Male</option>
+  <option value="en-US-AriaNeural">English - Female</option>
+</select>
+
+<label>Speed: <span id="speedValue">1.0</span>x</label>
+<input type="range" id="speed"
+       min="0.5" max="2" step="0.1" value="1">
+
+<label>Message</label>
+<textarea id="message"
+  placeholder="พิมพ์ข้อความแล้วกด Enter..."></textarea>
+
+<button id="speak" type="button">พูดทันที (Enter)</button>
+<button id="stop" class="stop" type="button">หยุดพูด</button>
+<p id="status">พร้อมใช้งาน</p>
+
+<audio id="player" preload="none"></audio>
+
+<script>
+const audio = document.getElementById("player");
+const message = document.getElementById("message");
+const status = document.getElementById("status");
+const speakButton = document.getElementById("speak");
+
+let selectedDevice = null;
+let currentURL = null;
+let controller = null;
+let requestId = 0;
+
+function setStatus(text) {
+  status.textContent = text;
+}
+
+function stop() {
+  requestId++;
+
+  if (controller) {
+    controller.abort();
+    controller = null;
+  }
+
+  audio.pause();
+  audio.removeAttribute("src");
+  audio.load();
+
+  if (currentURL) {
+    URL.revokeObjectURL(currentURL);
+    currentURL = null;
+  }
+
+  speakButton.disabled = false;
+  setStatus("หยุดแล้ว");
+}
+
+document.getElementById("choose").onclick = async () => {
+  setStatus("กำลังเปิดหน้าต่างเลือก Output Device...");
+
+  try {
+    if (!window.isSecureContext) {
+      throw new Error("กรุณาเปิดผ่าน http://localhost:8765");
+    }
+    if (typeof navigator.mediaDevices?.selectAudioOutput !== "function") {
+      selectedDevice = "default";
+      document.getElementById("deviceName").textContent =
+        "ใช้ Output เริ่มต้นของ Windows";
+      setStatus(
+        "เบราว์เซอร์นี้เลือกอุปกรณ์โดยตรงไม่ได้ หากใช้ Virtual Microphone ให้ตั้งเป็น Default Output ใน Windows"
+      );
+      return;
+    }
+    if (typeof audio.setSinkId !== "function") {
+      throw new Error("เบราว์เซอร์นี้ไม่รองรับการเปลี่ยน Output Device");
+    }
+
+    const device = await navigator.mediaDevices.selectAudioOutput();
+    await audio.setSinkId(device.deviceId);
+
+    selectedDevice = device.deviceId;
+    document.getElementById("deviceName").textContent =
+      device.label || "Selected audio output";
+
+    setStatus("เลือก Output Device สำเร็จ");
+  } catch (error) {
+    setStatus("เลือกอุปกรณ์ไม่สำเร็จ: " + error.message);
+  }
+};
+
+async function speak() {
+  const text = message.value.trim();
+  if (!text) return;
+
+  if (!selectedDevice) {
+    setStatus("กรุณาเลือก Output Device ก่อน");
+    return;
+  }
+
+  stop();
+  const id = requestId;
+  controller = new AbortController();
+  speakButton.disabled = true;
+
+  try {
+    setStatus("กำลังสร้างเสียง...");
+
+    const response = await fetch("/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        voice: document.getElementById("voice").value
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) throw new Error("TTS server error");
+
+    const blob = await response.blob();
+    if (id !== requestId) return;
+
+    currentURL = URL.createObjectURL(blob);
+    audio.src = currentURL;
+    audio.playbackRate = Number(
+      document.getElementById("speed").value
+    );
+
+    await audio.play();
+    setStatus("กำลังพูดเข้า Discord...");
+  } catch (error) {
+    if (id === requestId && error.name !== "AbortError") {
+      setStatus("Error: " + error.message);
+    }
+  } finally {
+    if (id === requestId) {
+      speakButton.disabled = false;
+      controller = null;
+    }
+  }
+}
+
+audio.addEventListener("ended", () => {
+  setStatus("พูดเสร็จแล้ว");
+  if (currentURL) {
+    URL.revokeObjectURL(currentURL);
+    currentURL = null;
+  }
+});
+
+document.getElementById("speak").onclick = speak;
+document.getElementById("stop").onclick = stop;
+
+document.getElementById("speed").oninput = e => {
+  const speed = Number(e.target.value);
+  document.getElementById("speedValue").textContent =
+    speed.toFixed(1);
+  audio.playbackRate = speed;
+};
+
+message.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey &&
+      !e.isComposing && e.keyCode !== 229) {
+    e.preventDefault();
+    speak();
+  }
+});
+</script>
+</body>
+</html>
