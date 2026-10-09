@@ -11,6 +11,8 @@ import threading
 from pathlib import Path
 import wave
 from io import BytesIO
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from gtts import gTTS
 from PySide6.QtCore import QThread, QUrl, Qt, Signal
@@ -47,6 +49,10 @@ VOICE_LABELS = {
 EDGE_PROVIDER = "edge"
 WINDOWS_PROVIDER = "windows"
 GTTS_PROVIDER = "gtts"
+NINE_ROUTER_PROVIDER = "9router"
+NINE_ROUTER_ENDPOINT = "http://localhost:20128/v1/audio/speech"
+NINE_ROUTER_MODEL = "gemini/gemini-3.1-flash-tts-preview/Zephyr"
+NINE_ROUTER_API_KEY_ENV = "NINE_ROUTER_API_KEY"
 PIPER_PROVIDER = "piper"
 PIPER_MIXED_PROVIDER = "piper-mixed"
 PIPER_MODEL = "th_TH-tsync2-medium"
@@ -252,6 +258,8 @@ class TTSWorker(QThread):
                 audio_data = self._generate_windows_audio()
             elif self.provider == GTTS_PROVIDER:
                 audio_data = self._generate_gtts_audio()
+            elif self.provider == NINE_ROUTER_PROVIDER:
+                audio_data = self._generate_nine_router_audio()
             elif self.provider == PIPER_PROVIDER:
                 audio_data = self._generate_piper_audio()
             elif self.provider == PIPER_MIXED_PROVIDER:
@@ -301,6 +309,41 @@ class TTSWorker(QThread):
         )
         speech.write_to_fp(audio_buffer)
         return audio_buffer.getvalue()
+
+    def _generate_nine_router_audio(self):
+        api_key = os.environ.get(NINE_ROUTER_API_KEY_ENV, "").strip()
+        if not api_key:
+            raise RuntimeError(
+                f"กรุณาตั้ง environment variable {NINE_ROUTER_API_KEY_ENV} ก่อนใช้ 9Router"
+            )
+
+        request_body = json.dumps(
+            {"model": self.voice, "input": self.text},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = Request(
+            NINE_ROUTER_ENDPOINT,
+            data=request_body,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=90) as response:
+                audio_data = response.read()
+        except HTTPError as error:
+            raise RuntimeError(f"9Router ตอบกลับ HTTP {error.code}") from None
+        except URLError:
+            raise RuntimeError(
+                "เชื่อมต่อ 9Router ไม่ได้ ตรวจว่า service ทำงานที่ localhost:20128"
+            ) from None
+
+        if not audio_data:
+            raise RuntimeError("9Router ไม่ได้ส่งข้อมูลเสียงกลับมา")
+        return audio_data
 
     def _generate_piper_audio(self):
         return self._generate_piper_wav(self.text)
@@ -440,6 +483,9 @@ class TTSWindow(QMainWindow):
         self.voice_source_combo = QComboBox()
         self.voice_source_combo.addItem("Edge TTS (ออนไลน์)", EDGE_PROVIDER)
         self.voice_source_combo.addItem("Google TTS ภาษาไทย (ออนไลน์)", GTTS_PROVIDER)
+        self.voice_source_combo.addItem(
+            "9Router Gemini TTS (localhost)", NINE_ROUTER_PROVIDER
+        )
         self.voice_source_combo.addItem("Piper ภาษาไทย (ออฟไลน์)", PIPER_PROVIDER)
         if any(voice["culture"].lower().startswith("en") for voice in self.windows_voices):
             self.voice_source_combo.addItem(
@@ -498,6 +544,9 @@ class TTSWindow(QMainWindow):
             return
         if provider == GTTS_PROVIDER:
             self.voice_combo.addItem("Thai (Google Translate TTS)", "th")
+            return
+        if provider == NINE_ROUTER_PROVIDER:
+            self.voice_combo.addItem("Gemini 3.1 Flash TTS - Zephyr", NINE_ROUTER_MODEL)
             return
         if provider == PIPER_PROVIDER:
             self.voice_combo.addItem("Thai tsync2 (medium, 63 MB)", PIPER_MODEL)

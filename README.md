@@ -18,6 +18,10 @@ python -m pip install -r requirements-piper-thai.txt
 python -m pip install --no-deps tltk==1.11
 ```
 
+For 9Router, start its local API on port `20128` and set `NINE_ROUTER_API_KEY`
+in the environment before launching the app. Keep the token out of source files
+and shell scripts.
+
 The separate TLTK install avoids its old `scikit-learn~=1.2` pin, which has no
 Python 3.13 wheel; the optional requirements install a newer version used by
 Piper's Thai phonemizer. The app downloads the Thai Piper model (about 63 MB) on
