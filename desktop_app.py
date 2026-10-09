@@ -52,6 +52,13 @@ GTTS_PROVIDER = "gtts"
 NINE_ROUTER_PROVIDER = "9router"
 NINE_ROUTER_ENDPOINT = "http://localhost:20128/v1/audio/speech"
 NINE_ROUTER_MODEL = "gemini/gemini-3.1-flash-tts-preview/Zephyr"
+NINE_ROUTER_MODELS = (
+    ("Gemini 2.5 Flash TTS - Zephyr", "gemini/gemini-2.5-flash-preview-tts/Zephyr"),
+    ("Gemini 2.5 Pro TTS - Zephyr", "gemini/gemini-2.5-pro-preview-tts/Zephyr"),
+    ("Gemini 3.8 Flash Lite TTS - Zephyr", "gemini/gemini-3.8-flash-lite-tts/Zephyr"),
+    ("Gemini 3.8 Flash TTS - Zephyr", "gemini/gemini-3.8-flash-tts/Zephyr"),
+    ("Gemini 3.1 Flash TTS Preview - Zephyr", NINE_ROUTER_MODEL),
+)
 NINE_ROUTER_API_KEY_ENV = "NINE_ROUTER_API_KEY"
 PIPER_PROVIDER = "piper"
 PIPER_MIXED_PROVIDER = "piper-mixed"
@@ -546,7 +553,8 @@ class TTSWindow(QMainWindow):
             self.voice_combo.addItem("Thai (Google Translate TTS)", "th")
             return
         if provider == NINE_ROUTER_PROVIDER:
-            self.voice_combo.addItem("Gemini 3.1 Flash TTS - Zephyr", NINE_ROUTER_MODEL)
+            for label, model_id in NINE_ROUTER_MODELS:
+                self.voice_combo.addItem(label, model_id)
             return
         if provider == PIPER_PROVIDER:
             self.voice_combo.addItem("Thai tsync2 (medium, 63 MB)", PIPER_MODEL)
